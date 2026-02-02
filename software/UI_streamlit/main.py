@@ -15,7 +15,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
 import streamlit as st
@@ -36,11 +36,11 @@ except Exception:
 # ---------------------------
 # Configuración general
 # ---------------------------
-st.set_page_config(page_title="Monitor de pH y Voltaje", layout="wide")
+st.set_page_config(page_title="pHScope", layout="wide")
 
 # Imagen en sidebar (si existe la ruta)
 try:
-    st.sidebar.image(SIDEBAR_IMAGE_PATH, width='stretch')
+    st.sidebar.image(SIDEBAR_IMAGE_PATH)
 except Exception:
     st.sidebar.caption("Sube/ajusta la imagen del encabezado (opcional).")
 
@@ -71,20 +71,57 @@ def ph_nernst(volts: float, E0: float, temp_c: float, sign: int = -1) -> float:
         return float("nan")
     return 7.0 + sign * (volts - E0) / S
 
+_MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
+
+def parse_measurements_from_line(line: str) -> Dict[str, Any]:
+    """
+    Intenta extraer mediciones desde una línea enviada por Serial.
+
+    Soporta formatos típicos, por ejemplo:
+      - "V=2.9734" / "V:2.9734" / "2.9734"
+      - "ADC:797 Voltage:0.642V pH:19.26"
+      - "ADC Value: 797 | Measured Voltage: 0.642V | pH: 19.26"
+      - '[SERVER] Recibido de e8:.. -> ADC:797 Voltage:0.642V pH:19.26'
+      - '{"V":2.97,"pH":7.01}'
+    """
+    out: Dict[str, Any] = {"V": None, "pH": None, "ADC": None, "raw": line}
+
+    m_adc = re.search(r"\bADC(?:\s*Value)?\s*[:=]\s*(\d+)\b", line, flags=re.IGNORECASE)
+    if m_adc:
+        out["ADC"] = int(m_adc.group(1))
+
+    m_ph = re.search(r"\bpH\s*[:=]\s*([+-]?\d+(?:\.\d+)?)\b", line, flags=re.IGNORECASE)
+    if m_ph:
+        out["pH"] = float(m_ph.group(1))
+
+    m_v = re.search(
+        r"(?:Measured\s*Voltage|Real\s*Voltage|Voltage)\s*[:=]\s*([+-]?\d+(?:\.\d+)?)\s*V?\b",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if m_v:
+        out["V"] = float(m_v.group(1))
+        return out
+
+    m_v2 = re.search(r"\b[Vv]\s*[:=]\s*([+-]?\d+(?:\.\d+)?)\b", line)
+    if m_v2:
+        out["V"] = float(m_v2.group(1))
+        return out
+
+    m_json_v = re.search(r"\"V\"\s*:\s*([+-]?\d+(?:\.\d+)?)", line)
+    if m_json_v:
+        out["V"] = float(m_json_v.group(1))
+        return out
+
+    # Fallback: solo cuando la línea NO parece un log con MAC (evita confundir "e8:27:..." con un valor).
+    if not _MAC_RE.search(line) and "Recibido de" not in line:
+        m_f = re.search(r"([+-]?\d+(?:\.\d+)?)", line)
+        if m_f:
+            out["V"] = float(m_f.group(1))
+    return out
+
 def parse_voltage_from_line(line: str) -> Optional[float]:
-    """
-    Extrae primer voltaje de una línea típica enviada por Arduino:
-     - "V=2.9734" / "V:2.9734" / "2.9734"
-     - "V,2.97,pH,7.01" (toma el primer float)
-     - '{"V":2.97,"pH":7.01}' (toma el primer float)
-    """
-    m = re.search(r"[Vv]\s*[:=]\s*([+-]?\d+(?:\.\d+)?)", line)
-    if m:
-        return float(m.group(1))
-    m2 = re.search(r"([+-]?\d+(?:\.\d+)?)", line)
-    if m2:
-        return float(m2.group(1))
-    return None
+    return parse_measurements_from_line(line).get("V")
 
 @dataclass
 class Sample:
@@ -106,6 +143,12 @@ if "buf_V" not in st.session_state:
     st.session_state.buf_pH_tp = deque(maxlen=MAX_BUFFER)
     st.session_state.buf_pH_nernst = deque(maxlen=MAX_BUFFER)
     st.session_state.buf_t = deque(maxlen=MAX_BUFFER)
+if "buf_pH_rx" not in st.session_state:
+    st.session_state.buf_pH_rx = deque(maxlen=MAX_BUFFER)
+if "buf_adc" not in st.session_state:
+    st.session_state.buf_adc = deque(maxlen=MAX_BUFFER)
+if "last_rx" not in st.session_state:
+    st.session_state.last_rx = {"raw": "", "V": None, "pH": None, "ADC": None}
 
 # Estado de Serial
 if "ser" not in st.session_state:
@@ -189,6 +232,8 @@ if st.sidebar.button("Reset buffers"):
     st.session_state.buf_pH_tp.clear()
     st.session_state.buf_pH_nernst.clear()
     st.session_state.buf_t.clear()
+    st.session_state.buf_pH_rx.clear()
+    st.session_state.buf_adc.clear()
     st.session_state.t0 = time.time()
     st.rerun()
 
@@ -197,7 +242,9 @@ if st.sidebar.button("Reset buffers"):
 # ---------------------------
 def read_sample_sim() -> float:
     t = time.time() - st.session_state.t0
-    return 2.97 + 0.005 * math.sin(2 * math.pi * t / 40.0)
+    v = 2.97 + 0.005 * math.sin(2 * math.pi * t / 40.0)
+    st.session_state.last_rx = {"raw": "SIM", "V": v, "pH": None, "ADC": None}
+    return v
 
 def read_sample_serial() -> Optional[float]:
     if not st.session_state.serial_connected or st.session_state.ser is None:
@@ -206,8 +253,9 @@ def read_sample_serial() -> Optional[float]:
         line = st.session_state.ser.readline().decode(errors="ignore").strip()
         if not line:
             return None
-        V = parse_voltage_from_line(line)
-        return V
+        parsed = parse_measurements_from_line(line)
+        st.session_state.last_rx = parsed
+        return parsed.get("V")
     except SerialException:
         return None
     except Exception:
@@ -232,6 +280,8 @@ if V is not None:
     st.session_state.buf_pH_tp.append(ph_tp_val)
     st.session_state.buf_pH_nernst.append(ph_nernst_val)
     st.session_state.buf_t.append(t_rel)
+    st.session_state.buf_pH_rx.append(st.session_state.last_rx.get("pH"))
+    st.session_state.buf_adc.append(st.session_state.last_rx.get("ADC"))
 
 # ---------------------------
 # DataFrames
@@ -241,13 +291,15 @@ df = pd.DataFrame({
     "V": list(st.session_state.buf_V),
     "pH_2p": list(st.session_state.buf_pH_tp),
     "pH_nernst": list(st.session_state.buf_pH_nernst),
+    "pH_rx": list(st.session_state.buf_pH_rx),
+    "ADC": list(st.session_state.buf_adc),
 })
 df_vis = df.tail(int(window)).reset_index(drop=True)
 
 # ---------------------------
 # UI principal
 # ---------------------------
-st.title("Monitor de pH para saliva artificial")
+st.title("pHScope: Monitor de pH para saliva artificial")
 
 col1, col2 = st.columns(2)
 volt_placeholder = col1.empty()
@@ -259,16 +311,19 @@ table_placeholder = st.empty()
 if not df_vis.empty:
     volt_placeholder.line_chart(
         df_vis.set_index("t_rel")[["V"]],
-        width='stretch',
+        use_container_width=True,
         height=280,
     )
     col1.caption("Voltaje (V)")
 
 # Gráfico de pH (dos curvas)
 if not df_vis.empty:
+    ph_cols = ["pH_2p", "pH_nernst"]
+    if "pH_rx" in df_vis.columns and df_vis["pH_rx"].notna().any():
+        ph_cols.append("pH_rx")
     ph_placeholder.line_chart(
-        df_vis.set_index("t_rel")[["pH_2p", "pH_nernst"]],
-        width='stretch',
+        df_vis.set_index("t_rel")[ph_cols],
+        use_container_width=True,
         height=280,
     )
     col2.caption("pH (calibración 2 puntos vs Nernst)")
@@ -277,14 +332,17 @@ if not df_vis.empty:
 if not df.empty:
     last = df.iloc[-1]
     S_N = nernst_slope_volt_per_pH(temp_c)
+    rx_ph_txt = ""
+    if "pH_rx" in last and pd.notna(last["pH_rx"]):
+        rx_ph_txt = f" | pH(rx)={float(last['pH_rx']):.3f}"
     status_placeholder.markdown(
         f"**Último →** t={last['t_rel']:.1f}s | V={last['V']:.4f} V | "
-        f"pH(2p)={last['pH_2p']:.3f} | pH(Nernst)={last['pH_nernst']:.3f} | "
+        f"pH(2p)={last['pH_2p']:.3f} | pH(Nernst)={last['pH_nernst']:.3f}{rx_ph_txt} | "
         f"S_Nernst={S_N:.5f} V/pH"
     )
 
 # Tabla (ventana)
-table_placeholder.dataframe(df_vis, width='stretch', height=320)
+table_placeholder.dataframe(df_vis, use_container_width=True, height=320)
 
 # Botones de descarga (sin MediaFileHandler)
 col_d1, col_d2 = st.columns(2)
