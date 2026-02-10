@@ -152,19 +152,28 @@ void loop() {
   }
 
   if (millis() - gLastSendMs >= SEND_MS) {
-    int raw = analogRead(ADC_PIN); // 0–4095
-    float voltage = (raw * VREF) / ADC_RES / DIVISOR;
-    float phValue = 7.0f + ((2.506f - voltage) / 0.152f);
+    int raw = analogRead(ADC_PIN);
 
-    char msg[48];
-    snprintf(msg, sizeof(msg), "ADC:%d Voltage:%.3fV pH:%.2f", raw, voltage, phValue);
+    //float voltage = (raw * VREF) / ADC_RES / DIVISOR;
+    //float phValue = 7.0f + ((2.506f - voltage) / 0.152f);
+
+    //char msg[48];
+    //snprintf(msg, sizeof(msg), "ADC:%d Voltage:%.3fV pH:%.2f", raw, voltage, phValue);
+
+    //Serial.print("[CLIENT] ");
+    //Serial.println(msg);
+
+    // USANDO JSON
+    char msg[24];
+    int n = snprintf(msg, sizeof(msg), "{\"adc\":%d}\n", raw);
 
     Serial.print("[CLIENT] ");
-    Serial.println(msg);
+    Serial.print(msg);
 
     uint16_t written = USE_WRITE_RESP
-        ? gChar.write_resp((const uint8_t*)msg, strlen(msg))
-        : gChar.write((const uint8_t*)msg, strlen(msg));
+        ? gChar.write_resp((const uint8_t*)msg, n)
+        : gChar.write((const uint8_t*)msg, n);
+
     Serial.print("[CLIENT] write bytes=");
     Serial.println(written);
 
